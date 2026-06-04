@@ -5,7 +5,12 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.10.7] - Unreleased
+## [0.10.8] - Unreleased
+
+### Fixed
+- #994: Prevent crash in `zn` command when target namespace lacks IPM mappings
+
+## [0.10.7] - 2026-05-29
 
 ### Added
 - #408: Modules can now list dependencies without specifying version; will be assumed to be "*"
@@ -21,7 +26,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - #843: Optionally include tests when packaging using either the `-include-tests` flag or `<IncludeTests>1</IncludeTests>` in module.xml
 - #1079: Add semantic sorting and shortcuts to list-installed
 - #1152: Adds information about scoped dependencies in the output array of BuildDependencyGraph()
-- #994: prevent crash when target namespace lacks IPM mappings
 
 ### Fixed
 - #1175: Fix issue parsing version for packages with both deployed and non-deployed versions
