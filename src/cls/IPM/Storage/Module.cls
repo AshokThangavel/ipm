@@ -85,6 +85,8 @@ Property AfterInstallMessage As %String(MAXLEN = "", XMLPROJECTION = "Element");
 
 Property Deployed As %Boolean(XMLPROJECTION = "Element");
 
+Property IncludeTests As %Boolean(XMLPROJECTION = "Element");
+
 Property UpdatePackage As %Dictionary.Classname;
 
 /// Iterates through all of a module's update step classes and tries to either execute or seed those steps.
@@ -159,12 +161,12 @@ Method HandleAllUpdateSteps(
 }
 
 /// For a given version, seed or execute update steps listed in the module's update package version class
-/// 
+///
 /// If seeding: For only steps that don't have a TimeStampEnd value or have an errored status, set it's TimeStampEnd to the current time
-/// 
+///
 /// If executing: Only start running steps at the first one found not to have a TimeStampEnd value or if an errored step is found
 ///               After finding this step, run it and all subsequent steps, regardless of if they have been run or not.
-/// 
+///
 /// newStepToApply - Gets marked as true to tell us to run all remaining steps in the list, whether or not they have been run/seeded before
 ///                  Can carry this over to subsequent calls by passing the newStepToApply variable to those HandleUpdateStepsFromList() calls
 Method HandleUpdateStepsFromList(
@@ -624,19 +626,47 @@ ClassMethod ExecutePhases(
                     // Lifecycle before / (phase) / after
                     new $$$DeployedProjectInstalled
                     $$$ThrowOnError(tLifecycle.OnBeforePhase(tOnePhase,.pParams))
+
+                    // Self-uninstall: Finalize history before Clean phase deletes IPM's own classes
+                    set isSelfUninstall = (tOnePhase = "Clean") && (tModule.Name = $$$IPMModuleName)
+                    if isSelfUninstall && $isobject(pLog) {
+                        // Log the Clean phase completion and finalize now
+                        do pLog.FinalizePhase(tOnePhase, $$$OK)
+                        set tSC = pLog.Finalize($$$OK, 0)
+                        $$$ThrowOnError(tSC)
+                        // Explicitly persist to twin while History classes still exist
+                        $$$ThrowOnError(pLog.PersistToTwin())
+                        // Delete the temp record immediately to prevent %OnClose() from trying to reload it later
+                        $$$ThrowOnError(pLog.%DeleteId(pLog.%Id()))
+                        // Clear the log object reference so it's not used again
+                        set pLog = ""
+                    }
+
                     $$$ThrowOnError($method(tLifecycle,"%"_tOnePhase,.pParams))
+
+                    // Self-uninstall: After Clean deletes IPM's own classes, skip all post-phase callbacks
+                    if isSelfUninstall {
+                        // Print success message before skipping
+                        write !,"["_$namespace_"|"_tModule.DisplayName_"]",$char(9),tOnePhase," SUCCESS"
+                        if tTiming {
+                            write " ("_($zhorolog-tStart)_" s)"
+                        }
+                        // Skip all post-phase processing - classes have been deleted
+                        continue
+                    }
+
                     $$$ThrowOnError(tLifecycle.OnAfterPhase(tOnePhase,.pParams))
                 }
 
                 #; Call Invoke Methods After Phase
                 set tKey = ""
                 for {
-                set tInvoke = tModule.Invokes.GetNext(.tKey)
-                if (tKey = "") || '$isobject(tInvoke) {
-                    quit // '$IsObject can happen reasonably after namespace changes
-                }
-                set tSC = tInvoke.OnAfterPhase(tOnePhase,.pParams)
-                quit:$$$ISERR(tSC)
+                    set tInvoke = tModule.Invokes.GetNext(.tKey)
+                    if (tKey = "") || '$isobject(tInvoke) {
+                        quit // '$IsObject can happen reasonably after namespace changes
+                    }
+                    set tSC = tInvoke.OnAfterPhase(tOnePhase,.pParams)
+                    quit:$$$ISERR(tSC)
                 }
                 quit:$$$ISERR(tSC)
 
@@ -717,7 +747,14 @@ ClassMethod Uninstall(
         set tSC = e.AsStatus()
     }
 	set devMode = $get(pParams("DeveloperMode", 0))
-	set tSC = $$$ADDSC(tSC, log.Finalize(tSC, devMode))
+	// Only finalize if log wasn't already finalized and deleted (e.g., during self-uninstall)
+	if $isobject(log) {
+		try {
+			set tSC = $$$ADDSC(tSC, log.Finalize(tSC, devMode))
+		} catch {
+			// Skip if log was already deleted during self-uninstall
+		}
+	}
     quit tSC
 }
 
@@ -842,6 +879,8 @@ ClassMethod HasScope(
 /// <li>Depth in the dependency tree (1 for direct dependencies, 2 for transitive, etc.)</li>
 /// <li>Repository from which the module will be obtained (empty if already installed)</li>
 /// <li>Version string of the module to be installed</li>
+/// <li>Display name of the module</li>
+/// <li>Scope of the module, or empty string if the dependency is not scoped</li>
 /// </ul>
 /// <p>
 /// <b>Parameters:</b><br>
@@ -851,6 +890,7 @@ ClassMethod HasScope(
 /// <var>pIgnoreInstalledModules</var> - If true, don't use already-installed modules.<br>
 /// <var>pPermitDowngrade</var> - If true, allow downgrading installed modules.<br>
 /// <var>pCheckNestedScoped</var> - If true, check scoped dependencies against root module phases.<br>
+/// <var>pCoUpdatingModules</var> - %List of module names being co-updated in the same batch; excluded from installed-version SQL check to avoid stale constraint conflicts.<br>
 /// NOTE: Other parameters are placeholders to match signature of original BuildDependencyGraph method for backward compatibility.
 Method BuildDependencyGraph(
 	ByRef pDependencyGraph,
@@ -866,7 +906,8 @@ Method BuildDependencyGraph(
 	pPermitDowngrade As %Boolean = 0,
 	pCheckNestedScoped As %Boolean = 0,
 	ByRef pIgnore7,
-	pIgnore8) As %Status [ Internal ]
+	pIgnore8,
+	pCoUpdatingModules As %List = "") As %Status [ Internal ]
 {
     set sc = $$$OK
     try {
@@ -950,7 +991,8 @@ Method BuildDependencyGraph(
                         // Working data
                         .pDependencyGraph, .workQueue,
                         // Caches
-                        .repoSearchCache, .manifestCache, .moduleCache)
+                        .repoSearchCache, .manifestCache, .moduleCache,
+                        pCoUpdatingModules)
                     $$$ThrowOnError(sc)
                 }
 
@@ -970,7 +1012,8 @@ Method BuildDependencyGraph(
                         // Working data
                         .pDependencyGraph, .workQueue,
                         // Caches
-                        .repoSearchCache, .manifestCache, .moduleCache)
+                        .repoSearchCache, .manifestCache, .moduleCache,
+                        pCoUpdatingModules)
                     // For fuzzy, continue even if one fails
                     if $$$ISERR(sc) {
                         // Error will surface later if unresolvable
@@ -1022,6 +1065,7 @@ Method BuildDependencyGraph(
 /// <var>pRepoSearchCache</var> - Cache of repository search results<br>
 /// <var>pManifestCache</var> - Cache of retrieved module manifests<br>
 /// <var>pModuleCache</var> - Cache of loaded module objects<br>
+/// <var>pCoUpdatingModules</var> - %List of module names being co-updated in the same batch; excluded from installed-version SQL check to avoid stale constraint conflicts.<br>
 Method ProcessSingleDependencyIterative(
 	pIsExact As %Boolean,
 	pDep As %IPM.Storage.ModuleReference,
@@ -1037,7 +1081,8 @@ Method ProcessSingleDependencyIterative(
 	ByRef pWorkQueue,
 	ByRef pRepoSearchCache,
 	ByRef pManifestCache,
-	ByRef pModuleCache) As %Status [ Internal, Private ]
+	ByRef pModuleCache,
+	pCoUpdatingModules As %List = "") As %Status [ Internal, Private ]
 {
     set sc = $$$OK
     try {
@@ -1063,7 +1108,8 @@ Method ProcessSingleDependencyIterative(
 
         if 'pIgnoreInstalledModules {
             // Apply requirements from other installed modules
-            set otherDepsList = pKnownDependencies
+            // Excludes sibling modules that are also being concurrently updated
+            set otherDepsList = pKnownDependencies _ pCoUpdatingModules
             set existingDepKey = ""
             for {
                 set existingDepKey = $order(pDependencyGraph(existingDepKey))
@@ -1074,7 +1120,7 @@ Method ProcessSingleDependencyIterative(
             }
 
             set sc = ##class(%IPM.Utils.Module).GetRequiredVersionExpression(
-                pDep.Name,otherDepsList,.installedReqExpr,.installedConstraintList
+                pDep.Name,otherDepsList,,.installedReqExpr,.installedConstraintList
             )
             $$$ThrowOnError(sc)
             set searchExpr = searchExpr.And(installedReqExpr)
@@ -1098,7 +1144,7 @@ Method ProcessSingleDependencyIterative(
                 localObj.Version.Satisfies(searchExpr) &&
                 ((version = "") || (version = localObj.VersionString))
             if installedVersionValid && '(localObj.Version.IsSnapshot() && pForceSnapshotReload) {
-                set pDependencyGraph(pDep.Name) = $listbuild(pDepth,"",localObj.VersionString,pDep.DisplayName)
+                set pDependencyGraph(pDep.Name) = $listbuild(pDepth,"",localObj.VersionString,pDep.DisplayName,pDep.Scope)
                 set pDependencyGraph(pDep.Name,pParentInfo) = pDep.VersionString
 
                 // Add to work queue for next depth
@@ -1160,7 +1206,7 @@ Method ProcessSingleDependencyIterative(
             }
 
             set pDependencyGraph(pDep.Name) = $listbuild(
-                pDepth, qualifiedReference.ServerName, moduleObj.VersionString, qualifiedReference.Deployed, qualifiedReference.PlatformVersion,pDep.DisplayName
+                pDepth, qualifiedReference.ServerName, moduleObj.VersionString, pDep.DisplayName, pDep.Scope
             )
             set pDependencyGraph(pDep.Name,pParentInfo) = pDep.VersionString
 
@@ -1195,7 +1241,7 @@ Method ProcessSingleDependencyIterative(
                 // occurs if needed.
                 set depth = $select(previousDepth=0:pDepth,previousDepth>pDepth:previousDepth,1:pDepth)
                 set dependencyGraph(pDep.Name) = $listbuild(
-                    depth,qualifiedReference.ServerName,moduleObj.VersionString,pDep.DisplayName
+                    depth,qualifiedReference.ServerName,moduleObj.VersionString,pDep.DisplayName,pDep.Scope
                 )
                 set dependencyGraph(pDep.Name,pParentInfo) = pDep.VersionString
 
@@ -1301,13 +1347,6 @@ Method GetResolvedReferences(
 {
     set tSC = $$$OK
     try {
-        if '$data(pDependencyGraph) {
-            set tSC = ..BuildDependencyGraph(.pDependencyGraph,,,,pPhases)
-            if $$$ISERR(tSC) {
-                quit
-            }
-        }
-
         set pReferenceArray(..Name, ..Name_".ZPM") = ""
 
         set orderedResourceList = ..GetOrderedResourceList()
@@ -1324,6 +1363,8 @@ Method GetResolvedReferences(
             set tSC = tResource.ResolveChildren(.tempArray)
             set resourceScope = tResource.Scope
             set attrScope = $get(tempArray("Scope"))
+            // Kill before merge so "Scope" doesn't leak into pReferenceArray as a resource name.
+            kill tempArray("Scope")
             if ..HasScope(pPhases, resourceScope) && ..HasScope(pPhases, attrScope) {
                 merge pReferenceArray(..Name) = tempArray
             }
@@ -1336,6 +1377,12 @@ Method GetResolvedReferences(
         }
 
         if pLockedDependencies {
+            if '$data(pDependencyGraph) {
+                set tSC = ..BuildDependencyGraph(.pDependencyGraph,,,,pPhases)
+                if $$$ISERR(tSC) {
+                    quit
+                }
+            }
             set tModName = ""
             for {
                 set tModName = $order(pDependencyGraph(tModName))
@@ -1400,7 +1447,7 @@ Method OverrideLifecycleClassSet(pValue As %Dictionary.Classname) As %Status
 
 /// This callback method is invoked by the <METHOD>%New</METHOD> method to
 /// provide notification that a new instance of an object is being created.
-/// 
+///
 /// <P>If this method returns an error then the object will not be created.
 /// <p>It is passed the arguments provided in the %New call.
 /// When customizing this method, override the arguments with whatever variables and types you expect to receive from %New().
@@ -1416,7 +1463,7 @@ Method %OnNew() As %Status [ Private, ServerOnly = 1 ]
 
 /// This callback method is invoked by the <METHOD>%Open</METHOD> method to
 /// provide notification that the object specified by <VAR>oid</VAR> is being opened.
-/// 
+///
 /// <P>If this method returns an error then the object will not be opened.
 Method %OnOpen() As %Status [ Private, ServerOnly = 1 ]
 {
@@ -1446,7 +1493,7 @@ Method %OnOpen() As %Status [ Private, ServerOnly = 1 ]
 
 /// This callback method is invoked by the <METHOD>%ValidateObject</METHOD> method to
 /// provide notification that the current object is being validated.
-/// 
+///
 /// <P>If this method returns an error then <METHOD>%ValidateObject</METHOD> will fail.
 Method %OnValidateObject() As %Status [ Private, ServerOnly = 1 ]
 {
@@ -1535,7 +1582,7 @@ Method %OnValidateObject() As %Status [ Private, ServerOnly = 1 ]
 /// either because %Save() was invoked on this object or on an object that references this object.
 /// %OnAddToSaveSet can modify the current object. It can also add other objects to the current
 /// SaveSet by invoking %AddToSaveSet or remove objects by calling %RemoveFromSaveSet.
-/// 
+///
 /// <P>If this method returns an error status then %Save() will fail and the transaction
 /// will be rolled back.
 Method %OnAddToSaveSet(
@@ -1570,7 +1617,7 @@ Method %OnAddToSaveSet(
 }
 
 /// Get an instance of an XML enabled class.<br><br>
-/// 
+///
 /// You may override this method to do custom processing (such as initializing
 /// the object instance) before returning an instance of this class.
 /// However, this method should not be called directly from user code.<br>
@@ -1778,8 +1825,9 @@ Method %Evaluate(
     set customParams("packagename") = ..Name
     set customParams("version") = ..VersionString
     set customParams("verbose") = +$get(pParams("Verbose"))
-    set customParams("ipmDir") = ##class(%Library.File).NormalizeDirectory($system.Util.DataDirectory() _ "ipm/" _ ..Name _ "/" _ ..VersionString)
+    set customParams("ipmDir") = ##class(%Library.File).NormalizeDirectory(##class(%IPM.Repo.UniversalSettings).GetModuleRoot() _ ..Name _ "/" _ ..VersionString)
     set tAttrValue = ##class(%IPM.Utils.Module).%EvaluateMacro(tAttrValue)
+    do ##class(%IPM.Storage.ModuleSetting.Default).ResolvePlaceholders(.customParams)
     set tAttrValue = ##class(%IPM.Storage.ModuleSetting.Default).EvaluateAttribute(tAttrValue,.customParams)
     set attrValue = ##class(%IPM.Utils.Module).%EvaluateSystemExpression(tAttrValue)
 
@@ -1801,9 +1849,9 @@ Method %Evaluate(
 /// This callback method is invoked by the <METHOD>%Save</METHOD> method to
 /// provide notification that the object is being saved. It is called before
 /// any data is written to disk.
-/// 
+///
 /// <P><VAR>insert</VAR> will be set to 1 if this object is being saved for the first time.
-/// 
+///
 /// <P>If this method returns an error then the call to <METHOD>%Save</METHOD> will fail.
 Method %OnBeforeSave(insert As %Boolean) As %Status [ Private, ServerOnly = 1 ]
 {
@@ -1921,6 +1969,9 @@ Storage Default
 </Value>
 <Value name="29">
 <Value>UpdatePackage</Value>
+</Value>
+<Value name="30">
+<Value>IncludeTests</Value>
 </Value>
 </Data>
 <DataLocation>^IPM.Storage.ModuleD</DataLocation>

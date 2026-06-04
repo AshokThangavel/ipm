@@ -262,6 +262,7 @@ Method CheckBeforeClean(
         set tVerbose = $get(pParams("Verbose"))
         set tLevel = $get(pParams("Clean","Level"),0)
         set tRecurse = $get(pParams("Clean","Recurse"),1)
+        set tForce = $get(pParams("Clean","Force"),0)
 
         if (..Module.GlobalScope && '$get(pParams("Clean","GlobalScope"))) {
             do ..Log("Clean SKIPPED - module has global scope.")
@@ -269,7 +270,7 @@ Method CheckBeforeClean(
             quit
         }
 
-        if '$get(pParams("Clean","Force")) {
+        if 'tForce {
             // Check to see if anything depends on this module and return an error status if it does.
             set tSC = ##class(%IPM.Utils.Module).GetDependentsList(.tList,,..Module.Name)
             if $$$ISERR(tSC) {
@@ -487,9 +488,12 @@ Method %Clean(ByRef pParams) As %Status
         }
 
         if (tLevel > 0) && '$get(pParams("Clean","Nested"),0) {
-            set tSC = ##class(%IPM.StudioDocument.Module).Delete(..Module.Name_".ZPM")
-            if $$$ISERR(tSC) {
-                quit
+            // Check if StudioDocument.Module class still exists before trying to delete
+            if $$$comClassDefined("%IPM.StudioDocument.Module") {
+                set tSC = ##class(%IPM.StudioDocument.Module).Delete(..Module.Name_".ZPM")
+                if $$$ISERR(tSC) {
+                    quit
+                }
             }
         }
     } catch e {
@@ -1145,21 +1149,27 @@ Method %Export(
         kill pDependencyGraph
         if ($get(pTargetDirectory) = "") {
             set pTargetDirectory = $$$lcase(..Module.Name_"-"_..Module.VersionString)
-            set pTargetDirectory = ##class(%File).NormalizeDirectory(pTargetDirectory, $$$FileTempDirSys)
+            set pTargetDirectory = ##class(%File).NormalizeDirectory(pTargetDirectory, ##class(%IPM.Utils.File).CreateTempDirectory(##class(%SYS.System).TempDirectory()))
         }
 
         if '##class(%File).DirectoryExists(pTargetDirectory) {
-            kill %objlasterror
-            set tCreated = ##class(%File).CreateDirectoryChain(pTargetDirectory,.tReturnValue)
-            if 'tCreated {
-                set tLastErr = $get(%objlasterror)
-                set tSC = $$$EMBEDSC($$$ERROR($$$GeneralError,$$$FormatText("Error creating directory %1: %2",pTargetDirectory,tReturnValue)),tLastErr)
+            set tSC = ##class(%IPM.Utils.File).CreateDirectoryChain(pTargetDirectory)
+            if $$$ISERR(tSC) {
                 quit
             }
         }
 
         set tExportDependencies = $get(pParams("ExportDependencies"), ..#EXPORTDEPENDENCIES)
-        set tSC = ..Module.GetResolvedReferences(.tResourceArray, tExportDependencies,..PhaseList,.pDependencyGraph)
+        set phaseList = ..PhaseList
+        if $get(pParams("IncludeTests"), ..Module.IncludeTests) {
+            if '$listfind(phaseList, "Test") {
+                set phaseList = phaseList_$listbuild("Test")
+            }
+            if '$listfind(phaseList, "Verify") {
+                set phaseList = phaseList_$listbuild("Verify")
+            }
+        }
+        set tSC = ..Module.GetResolvedReferences(.tResourceArray, tExportDependencies, phaseList, .pDependencyGraph)
         if $$$ISERR(tSC) {
             quit
         }
@@ -1186,16 +1196,6 @@ Method %Export(
             }
         }
 
-        // Deployed items should be exported as a studio project to a designated directory
-        set tDeployedProjectName = ##class(%IPM.Utils.Module).GetDeployedProjectName(..Module.Name)
-        set tDeployedProject = ##class(%Studio.Project).%OpenId(tDeployedProjectName)
-        if '$isobject(tDeployedProject) {
-            set tDeployedProject = ##class(%Studio.Project).%New()
-            set tDeployedProject.Name = tDeployedProjectName
-        }
-        do tDeployedProject.Items.Clear()
-        set tParams($$$DeployedProjectIndex) = tDeployedProject
-
         set tModuleName = ""
         set exportPythonDependencies = $get(pParams("ExportPythonDependencies"), 0)
         for {
@@ -1207,18 +1207,30 @@ Method %Export(
                 set tModule = ##class(%IPM.Storage.Module).NameOpen(tModuleName)
                 do ..ExportPythonDependencies(tModule, .pParams)
                 // Recalculate resource array to pick up any python dependencies added during export
-                $$$ThrowOnError(..Module.GetResolvedReferences(.tResourceArray,tExportDependencies,..PhaseList,.pDependencyGraph))
+                $$$ThrowOnError(..Module.GetResolvedReferences(.tResourceArray,tExportDependencies,phaseList,.pDependencyGraph))
             }
             kill tSingleModuleArray
             merge tSingleModuleArray = tResourceArray(tModuleName)
-            do ..ExportSingleModule(.tSingleModuleArray, pTargetDirectory, .pDependencyGraph, .tParams, tVerbose)
-        }
 
-        // Export the deployed project to the target directory, if it's non-empty
-        if tDeployedProject.Items.Count() > 0 {
-            // Intentionally not calling .%Save() on the project; we don't want to persist it.
-            set tDeployedProjectPath = ##class(%IPM.Utils.Module).GetDeployedProjectPath(pTargetDirectory)
-            $$$ThrowOnError(tDeployedProject.DeployToFile(tDeployedProjectPath, $select(tVerbose:"d",1:"-d")_"/createdirs"))
+            // Deployed items for each module + dependency should be exported as a studio project to a designated directory
+            set tDeployedProjectName = ##class(%IPM.Utils.Module).GetDeployedProjectName(tModuleName)
+            set tDeployedProject = ##class(%Studio.Project).%OpenId(tDeployedProjectName)
+            if '$isobject(tDeployedProject) {
+                set tDeployedProject = ##class(%Studio.Project).%New()
+                set tDeployedProject.Name = tDeployedProjectName
+            }
+            do tDeployedProject.Items.Clear()
+            set tParams($$$DeployedProjectIndex) = tDeployedProject
+
+            do ..ExportSingleModule(.tSingleModuleArray, pTargetDirectory, .pDependencyGraph, .tParams, tVerbose)
+
+            // Export the deployed project for this module to the target directory, if it's non-empty
+            if tDeployedProject.Items.Count() > 0 {
+                // Intentionally not calling .%Save() on the project; we don't want to persist it.
+                set tDeployTargetDirectory = pTargetDirectory _ $get(pDependencyGraph(tModuleName, "Location"))
+                set tDeployedProjectPath = ##class(%IPM.Utils.Module).GetDeployedProjectPath(tDeployTargetDirectory)
+                $$$ThrowOnError(tDeployedProject.DeployToFile(tDeployedProjectPath, $select(tVerbose:"d",1:"-d")_"/createdirs"))
+            }
         }
 
         /// Always keep these files
@@ -1305,6 +1317,14 @@ Method %Verify(ByRef pParams) As %Status
         new $namespace
         set tInitNS = $select($namespace="%SYS": "USER", 1: $namespace)
         set tVerbose = $get(pParams("Verbose"))
+        set explicitQuiet = ($data(pParams("Verbose")) && (pParams("Verbose") = 0))
+
+        // Suppress module install/load noise in quiet mode; ended before resource processors
+        // run so each processor can manage its own output (Test.cls still shows summary + failures).
+        // Null device is process-scoped, so suppression survives the namespace switch below.
+        if explicitQuiet {
+            set suppressor = ##class(%IPM.Utils.OutputSuppressor).%New()
+        }
 
         if '$get(pParams("Verify","InCurrentNamespace"),0) {
             set tMustCreate = 1
@@ -1387,6 +1407,9 @@ Method %Verify(ByRef pParams) As %Status
 
         // Load dependencies scoped to the "Verify" phase that are not yet installed.
         do ##class(%IPM.Utils.Module).LoadDependencies(..Module, ..PhaseList, .pParams)
+
+        // End suppression before resource processors run — each handles its own output.
+        set suppressor = ""
 
         set orderedResourceList = ..Module.GetOrderedResourceList()
         set tKey = ""
@@ -1939,12 +1962,7 @@ Method ExportSingleModule(
             set tSC = $$$OK
             set tDirectory = ##class(%File).GetDirectory(tExportPath,1)
             if '##class(%File).DirectoryExists(tDirectory) {
-                set tGood = ##class(%File).CreateDirectoryChain(tDirectory,.tReturn)
-                if 'tGood {
-                    set tLastErr = $get(%objlasterror)
-                    set tSC = $$$EMBEDSC($$$ERROR($$$GeneralError,$$$FormatText("Error creating directory '%1': %2",tDirectory,tReturn)),tLastErr)
-                    $$$ThrowOnError(tSC)
-                }
+                $$$ThrowOnError(##class(%IPM.Utils.File).CreateDirectoryChain(tDirectory))
                 write:pVerbose !,"Created ",tDirectory
             }
             if ##class(%File).DirectoryExists(tSourcePath) {
@@ -1964,7 +1982,7 @@ Method ExportSingleModule(
             }
         } elseif (tExt = "CLS") || (tExt = "DFI") || (tExt = "PRJ") || ($zconvert($extract(tFullPath,$length(tFullPath)-2,*),"l")="xml") || (##class(%RoutineMgr).UserType(tFullResourceName)) {
             if '##class(%File).Exists(tFullPath) {
-                do ##class(%File).CreateDirectoryChain(##class(%File).GetDirectory(tFullPath))
+                $$$ThrowOnError(##class(%IPM.Utils.File).CreateDirectoryChain(##class(%File).GetDirectory(tFullPath)))
             }
             set tSC = $$Export^%occXMLExport(tFullPath,"-d /diffexport/createdirs",tFullResourceName)
             $$$ThrowOnError(tSC)

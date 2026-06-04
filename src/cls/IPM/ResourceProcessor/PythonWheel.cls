@@ -18,6 +18,14 @@ Method OnPhase(
 	ByRef pParams,
 	Output pResourceHandled As %Boolean = 0) As %Status
 {
+    if (pPhase = "Clean") {
+        // Mark as handled to prevent fallback to generic cleanup
+        // which tries to delete wheels as Studio documents
+        // TODO: actually cleanup the python wheel. This is non-trivial because we don't want to delete the wheel if it's shared with other modules
+        set pResourceHandled = 1
+        quit $$$OK
+    }
+
     if (pPhase '= "Initialize") {
         set pResourceHandled = 0
         quit $$$OK
@@ -44,7 +52,14 @@ Method OnPhase(
         if verbose {
             write !,"Running command: ",command
         }
-        $$$ThrowOnError(##class(%IPM.Utils.Module).RunCommand(, command))
+        set explicitQuiet = ($data(pParams("Verbose")) && (pParams("Verbose") = 0))
+        if explicitQuiet {
+            // Redirect pip stdout/stderr to a sink stream so subprocess output doesn't bypass device suppression
+            set pipOutput = ##class(%Stream.TmpCharacter).%New()
+            $$$ThrowOnError(##class(%IPM.Utils.Module).RunCommand(, command, .pipOutput, .pipOutput))
+        } else {
+            $$$ThrowOnError(##class(%IPM.Utils.Module).RunCommand(, command))
+        }
     } catch ex {
         set pResourceHandled = 0
         // Special case: we want the installation of IPM to continue, even if the wheel package fails to install
@@ -79,8 +94,9 @@ Method OnExportItem(
         return $$$ERROR($$$GeneralError, "File """_dir_""" exists and is not a directory. Failed to export item: "_..Name)
     }
     if '##class(%File).DirectoryExists(dir) {
-        if '##class(%File).CreateDirectoryChain(dir, .return) {
-            return $$$ERROR($$$GeneralError, "Failed to create directory "_dir_", OS returned code: "_-return)
+        set sc = ##class(%IPM.Utils.File).CreateDirectoryChain(dir)
+        if $$$ISERR(sc) {
+            return sc
         }
     }
     if verbose {

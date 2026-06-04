@@ -73,8 +73,10 @@ Can also specify desired version to update to.
 <modifier name="env" aliases="e" dataAlias="EnvFiles" value="true" description="Semicolon separated paths to the environment files in json format. See wiki for details." />
 <modifier name="only" aliases="o" description="Only runs the specified phase(s), rather than also running predecessors." />
 <modifier name="dev" dataAlias="DeveloperMode" dataValue="1" description="Sets the DeveloperMode flag for the module's lifecycle. Key consequences of this are that ^Sources will be configured for resources in the module, and installer methods will be called with the dev mode flag set." />
-<modifier name="quiet" aliases="q" dataAlias="Verbose" dataValue="0" description="Produces minimal output from the command." />
-<modifier name="verbose" aliases="v" dataAlias="Verbose" dataValue="1" description="Produces verbose output from the command." />
+<modifier name="quiet" aliases="q" dataAlias="Verbose" dataValue="0" description="Produces minimal output. For test and verify: suppresses build/install noise while still showing the result summary and any failures." />
+<modifier name="verbose" aliases="v" dataAlias="Verbose" dataValue="1" description="Produces verbose output. For test and verify: shows per-method results in the result summary when combined with -f; without -f only the summary is shown." />
+<modifier name="format" aliases="f" dataAlias="outputformat" value="true" valueList="json,yaml,toon" description="(test and verify only) One-shot output format override for the test result summary. Overrides the persistent default set via 'config set TestReportFormat &lt;format&gt;'. When neither -f nor config is set, the default summary and legacy failure lines are shown. Use 'config delete TestReportFormat' to revert to default." />
+<modifier name="output-file" dataAlias="outputfile" value="true" description="(test and verify only) Path to write full test results to a file. Format is inferred from the file extension (.json, .yaml, .toon, .xml)." />
 <modifier name="export-deps" value="true" valueList="0,1" dataAlias="ExportDependencies" description="If specified, controls whether dependencies are exported. If omitted, defaults to the value of the #EXPORTDEPENDENCIES in lifecycle class. This modifier is only used in &quot;Package&quot; and &quot;Publish&quot; lifecycles." />
 
 </command>
@@ -124,6 +126,7 @@ This command is an alias for `module-action module-name package`
 <modifier name="path" aliases="p" dataAlias="Path" value="true" description="the specified path to export package." />
 <modifier name="export-deps" value="true" valueList="0,1" dataAlias="ExportDependencies" description="If specified, controls whether dependencies are exported. If omitted, defaults to the value of the #EXPORTDEPENDENCIES in lifecycle class. This modifier is only used in &quot;Package&quot; and &quot;Publish&quot; lifecycles." />
 <modifier name="export-python-deps" dataAlias="ExportPythonDependencies" dataValue="1" description="If specified, exports Python dependencies. If omitted, defaults to false." />
+<modifier name="include-tests" dataAlias="IncludeTests" dataValue="1" description="If specified, includes test-scoped resources in the package." />
 </command>
 
 <command name="verify" dataPrefix="D">
@@ -141,6 +144,7 @@ This command is an alias for `module-action module-name publish`
 <modifier name="repo" aliases="r" dataAlias="PublishTo" description="Namespace-unique name of repository for the module to publish to (if deployment is enabled)" />
 <modifier name="use-external-name" aliases="use-ext" dataAlias="UseExternalName" dataValue="1" description="Publish the package under the &lt;ExternalName&gt; of the package. If ExternalName is unspecified or illegal, an error will be thrown."/>
 <modifier name="export-python-deps" dataAlias="ExportPythonDependencies" dataValue="1" description="If specified, exports Python dependencies. If omitted, defaults to false." />
+<modifier name="include-tests" dataAlias="IncludeTests" dataValue="1" description="If specified, includes test-scoped resources in the package." />
 </command>
 
 <command name="update" dataPrefix="D">
@@ -527,6 +531,17 @@ reinstall -env /path/to/env1.json;/path/to/env2.json example-package
     list -python
 </example>
 
+<example description="Sort by name ascending (default). Shortforms: n=name, d=date, v=version. Append -d for descending.">
+    list -s [name|date|version]
+</example>
+
+<example description="Sort by name descending">
+    list -s name-desc
+</example>
+<example description="Sort by installation date descending">
+    list -s d-d
+</example>
+
 <!-- Parameters -->
 <parameter name="searchString" description="Search string, * can be used." />
 
@@ -538,6 +553,7 @@ reinstall -env /path/to/env1.json;/path/to/env2.json example-package
 <modifier name="showupstream" aliases="su" description="If specified, show the latest version for each module in configured repos if it's different than the local version." />
 <modifier name="repository" aliases="repo" value="true" description="If specified, only show modules installed that belong to the provided repository." />
 <modifier name="python" aliases="py" description="If specified, lists installed Embedded Python libraries instead of IPM modules." />
+<modifier name="sort" aliases="s" value="true" description="Sort the list. Default (no -s) is ascending by name with IPM on top. Options: name, name-desc, date, date-desc, version, version-desc. Shortforms: n, d, v; append -d for descending (e.g. n-d, d-d, v-d). Has no effect with -tree or -python." />
 </command>
 
 <command name="list-dependents" aliases="dependents">
@@ -1090,6 +1106,13 @@ ClassMethod ShellInternal(
             }
             do ..DisplayError(pException.AsStatus())
         }
+
+        // Check if IPM has uninstalled itself - exit gracefully if so
+        if $get(^||%IPM.SelfUninstallFlag, 0) {
+            write !,!,$$$FormattedLine($$$Yellow, "IPM has been uninstalled from this namespace. Exiting shell..."),!
+            return
+        }
+
         set tCommand = ""
         if tOneCommand {
             quit
@@ -2277,7 +2300,7 @@ ClassMethod LoadFromRepo(
 {
     set slash=$select($zversion(1)=3:"/",1:"\")
     set TempDir = ##class(%File).GetDirectory(##class(%File).GetDirectory($zutil(86))_"mgr"_slash_"Temp"_slash_$translate($ztimestamp,".,")_slash)
-    $$$ThrowOnError(##class(%File).CreateDirectoryChain(TempDir))
+    $$$ThrowOnError(##class(%IPM.Utils.File).CreateDirectoryChain(TempDir))
     set:$extract(tDirectoryName,*)="/" tDirectoryName=$extract(tDirectoryName,1,*-1)
     set RepoName=$piece($piece($piece(tDirectoryName,"/",*),".git")," ")
     set tCmd="cd "_TempDir_" && git clone "_tDirectoryName
@@ -2353,7 +2376,8 @@ ClassMethod LoadInternal(
     }
     set extension = $$$lcase($piece(tDirectoryName,".",*))
     if ##class(%File).Exists(tDirectoryName) && ((extension="tgz") || (extension="tar.gz")) {
-        set tTargetDirectory = $$$FileTempDirSys
+        set tTargetDirectory = ##class(%IPM.Utils.File).CreateTempDirectory(##class(%SYS.System).TempDirectory())
+        set tTempExtractionRoot = tTargetDirectory
         if $get(pCommandInfo("data", "Verbose")) {
             write !,"Extracting archive to ",tTargetDirectory
         }
@@ -2382,9 +2406,31 @@ ClassMethod LoadInternal(
         }
     }
 
-    // When loading a module from a local folder, there might be a <mod root>/.modules/ folder containining dependencies.
+    // When loading a module from a local folder, there might be a <mod root>/.modules/ folder containing dependencies.
     // It's easier to configure a temporary repository than to handle this case in the dependency resolution code.
     set tTargetDirectory = $get(tTargetDirectory, tDirectoryName)
+
+    // For tarball and URL sources, copy the extracted content to <ModuleRoot>/<name>/<version>/
+    // and clean up the temp extraction directory. Directory loads are left in-place so that
+    // live-edit workflows (mounted volumes, bootstrap) continue to work without re-loading.
+    if $get(tTempExtractionRoot) '= "" {
+        set tModuleObj = ##class(%IPM.Utils.Module).GetModuleObjectFromPath(tTargetDirectory, .tFound)
+        if 'tFound {
+            $$$ThrowStatus($$$ERROR($$$GeneralError,"No Module element found in module.xml at "_tTargetDirectory))
+        }
+        set tFinalDirectory = ##class(%Library.File).NormalizeDirectory(
+            ##class(%IPM.Repo.UniversalSettings).GetModuleRoot() _ tModuleObj.Name _ "/" _ tModuleObj.VersionString)
+        if ##class(%File).DirectoryExists(tFinalDirectory) {
+            $$$ThrowOnError(##class(%IPM.Utils.File).RemoveDirectoryTree(tFinalDirectory))
+        }
+        $$$ThrowOnError(##class(%IPM.Utils.File).CreateDirectoryChain(tFinalDirectory))
+        // Destination was just created empty above, so pDeleteFirst=0 is intentional.
+        // If CopyDir fails partway through, tFinalDirectory may be left in a partial state.
+        $$$ThrowOnError(##class(%IPM.Utils.File).CopyDir(tTargetDirectory, tFinalDirectory, 0))
+        $$$ThrowOnError(##class(%IPM.Utils.File).RemoveDirectoryTree(tTempExtractionRoot))
+        set tTargetDirectory = tFinalDirectory
+    }
+
     set dotModules = ##class(%File).NormalizeDirectory(".modules", tTargetDirectory)
     set tmpRepoMgr = ##class(%IPM.General.TempLocalRepoManager).%New(dotModules, 1)
     set tSC = ##class(%IPM.Utils.Module).LoadNewModule(tTargetDirectory, .tParams, , pLog)
@@ -2438,9 +2484,9 @@ ClassMethod Install(
             $$$ThrowOnError(..CheckModuleNamespace())
         }
         // check if any registries are configured and enabled
-        new SQLCODE, count
+        new SQLCODE, count, %msg
         &sql(SELECT COUNT(*) into :count FROM %IPM_Repo.Definition WHERE Enabled = 1)
-        $$$ThrowSQLIfError(SQLCODE,%message)
+        $$$ThrowSQLIfError(SQLCODE,%msg)
         if (SQLCODE = 0) && (count = 0) {
             $$$ThrowStatus($$$ERROR($$$GeneralError, "No repositories are configured and enabled in this namespace."))
         }
@@ -2563,6 +2609,40 @@ ClassMethod Uninstall(ByRef pCommandInfo) [ Internal ]
         }
         if (tModuleName = $$$IPMModuleName) {
             $$$ThrowOnError(..CheckModuleNamespace())
+
+            // Check if other modules are installed
+            set hasModules = 0
+            set rs = ##class(%SQL.Statement).%ExecDirect(,
+                "SELECT Name, VersionString FROM %IPM_Storage.ModuleItem WHERE Name != ?",
+                $$$IPMModuleName)
+            if rs.%Next() {
+                set hasModules = 1
+
+                // Show list of installed modules
+                write !,"The following modules are currently installed:"
+                write !,"  - ",rs.Name," (",rs.VersionString,")"
+                while rs.%Next() {
+                    write !,"  - ",rs.Name," (",rs.VersionString,")"
+                }
+                write !
+
+                if 'tForce {
+                    // Dialog: Ask about full cleanup (downgrade scenario)
+                    write !,"Do you want to fully remove all modules and IPM metadata (except history log)?"
+                    write !,"This is required for downgrading IPM. [y/N]: "
+                    read fullCleanupResponse
+                    set tParams("Clean","FullCleanup") = $case($zconvert(fullCleanupResponse,"L"),"y":1,"yes":1,:0)
+                }
+            }
+
+            if $get(tParams("Clean","FullCleanup")) {
+                // User chose full cleanup - uninstall all modules
+                write !,"Performing full cleanup: uninstalling all modules..."
+                $$$ThrowOnError(##class(%IPM.Utils.Module).UninstallAll(tForce,.tParams))
+            }
+
+            // Set flag to indicate self-uninstall - will be checked by Interactive() loop
+            set ^||%IPM.SelfUninstallFlag = 1
         }
         set tRecurse = $$$HasModifier(pCommandInfo,"recurse") // Recursively uninstall unneeded dependencies
         $$$ThrowOnError(##class(%IPM.Storage.Module).Uninstall(tModuleName,tForce,tRecurse,.tParams))
@@ -2821,8 +2901,81 @@ ClassMethod ListInstalled(ByRef pCommandInfo) [ Private ]
             }
         }
         merge tModifiers = pCommandInfo("modifiers")
+        set sortMode = $$$lcase($get(pCommandInfo("modifiers", "sort")))
+
+        // Always sort; default is name ascending; IPM is always positioned first
+        do ..SortList(.list, $select(sortMode'="":sortMode, 1:"n"))
+
         do ..DisplayModules(.list,,,, .tModifiers)
     }
+}
+
+/// Sort a module list in-place. IPM is always placed first regardless of sort direction.
+/// sortMode is a raw sort string: first char "n"=name, "d"=date, "v"=version;
+/// append "-d" for descending (e.g. "n-d", "d-d", "v-d"). Default: ascending by name.
+/// List entries are $listbuild(label, versionString, externalName, developerMode, root, lastUpdated)
+/// where label may be "ExternalName (internalName)" (e.g. "IPM (zpm)").
+ClassMethod SortList(ByRef list, sortModeRaw As %String) [ Internal ]
+{
+    set newlist = ""
+    set ipmEntry = ""
+    set rawLower = $$$lcase(sortModeRaw)
+    set type = $extract(rawLower, 1) // "n"=name, "d"=date, "v"=version; default ascending by name
+    set isDesc = (rawLower [ "-d")
+    set sortMode = $case(type, "n":"name", "d":"date", "v":"version", :"name")
+    if isDesc {
+        set sortMode = sortMode_"-desc"
+    }
+    set mlist = 0
+    for i=1:1:list {
+        set entry = list(i)
+        set label = $listget(entry,1)
+        // label may be "ExternalName (internalName)"; extract internal name to detect IPM
+        set internalName = $select(label["(": $piece($piece(label,"(",2),")",1), 1: label)
+        if $$$lcase(internalName) = $$$IPMModuleName {
+            set ipmEntry = entry
+            kill list(i)
+            continue
+        }
+        // guard against LastUpdated being absent — read field 6 before entry is extended with tiebreaker
+        set date = $listget(entry,6)
+        set entry = entry_$listbuild(i)
+        if sortMode = "name" || (sortMode = "name-desc") {
+            set newlist($$$lcase(label),i) = entry
+        } elseif sortMode = "date" || (sortMode = "date-desc") {
+            set newlist(date,label) = entry
+        } elseif sortMode = "version" || (sortMode = "version-desc") {
+            // Use SemanticVersion to parse the version string so all formats are handled correctly.
+            // Build a padded string key: pre-releases sort before their release (pre-release="~" means
+            // "no pre-release" and "~" collates after any alphabetic string, so releases sort last).
+            // Build metadata is ignored per semver spec.
+            set sv = ##class(%IPM.General.SemanticVersion).FromString($listget(entry,2))
+            set vKey = $translate($justify(sv.Major,5)," ","0")_"."_
+                       $translate($justify(sv.Minor,5)," ","0")_"."_
+                       $translate($justify(sv.Patch,5)," ","0")_"."_
+                       $select(sv.Prerelease'="": sv.Prerelease, 1: "~")
+            set newlist(vKey,label) = entry
+        }
+        kill list(i)
+    }
+    // IPM always goes first; place it at position 1 before the sorted entries
+    if ipmEntry '= "" {
+        set list($increment(mlist)) = ipmEntry
+    }
+    set direction = $select(isDesc: -1, 1: 1)
+    set sub = ""
+    // if newlist is not empty, reconstruct list in sorted order
+    if $data(newlist)>1 {
+        for {
+            set sub = $order(newlist(sub),direction) quit:sub=""
+            set mod=""
+            for {
+                set mod = $order(newlist(sub,mod),direction,data) quit:mod=""
+                set list($increment(mlist)) = data
+            }
+        }
+    }
+    set list = mlist
 }
 
 /// Get module list in currently namespace
@@ -3261,10 +3414,11 @@ ZPM(pArgs...)
     // TODO: Needs to support enabling IPM from here, also need to decide what level of customization to provide
     set quitOnError = $get(pArgs(2))
     set haltOnComplete = $get(pArgs(3))
-    write !, "IPM is not enabled in this namespace."
+    set currentNs = $namespace
     set rs = ##class(%SQL.Statement).%ExecDirect(, "SELECT Nsp FROM %SYS.Namespace_List()")
     if rs.%SQLCODE '= 0 {
-        write !, "Error getting namespace name. SQLCODE =", rs.%SQLCODE
+        write !, "Error getting namespace list. SQLCODE =", rs.%SQLCODE
+        write !, "IPM is not enabled in namespace ", currentNs, "."
     } else {
         new $namespace
         set found = 0
@@ -3272,17 +3426,17 @@ ZPM(pArgs...)
             set $namespace = $zstrip(rs.%Get("Nsp"), "<>WC")
             // Some I4H containers come with %IPM.Main but the "version" command doesn't work ?!
             if $system.CLS.IsMthd("%IPM.Main", "Shell") && ($namespace '= "HSLIB") && ($namespace '= "HSSYS") {
-                write !, "Change namespace to one of the following to run the ""zpm"" command"
+                write !, "IPM is not enabled in namespace ", currentNs, ". Switch to one of the following namespaces to use IPM:"
                 do ##class(%IPM.Main).Shell("version")
-                write !, "If you want to map IPM globally, switch to one of the namespaces above and run: zpm ""enable -map -globally""."
-                write !, "If you want to reset repository and map IPM globally along with repository settings, switch to one of the namespaces above and run: zpm ""enable -community""."
+                write !, "To map IPM globally, switch to one of the namespaces above and run: zpm ""enable -map -globally""."
+                write !, "To reset repository and map IPM globally with repository settings, run: zpm ""enable -community""."
                 set found = 1
                 quit
             }
         }
         // Shouldn't happen since %ZLANGC00.mac and %ZLANGF00.mac are present
         if 'found {
-            write !, "No namespace found with IPM enabled."
+            write !, "IPM is not installed. No namespace found with IPM enabled."
         }
     }
 

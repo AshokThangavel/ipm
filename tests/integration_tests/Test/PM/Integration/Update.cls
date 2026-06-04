@@ -641,6 +641,71 @@ Method TestInterchangeableNameUpdate()
     $$$ThrowOnError(##class(%IPM.Main).Shell("repo -n zot -delete"))
 }
 
+/// Tests that updating a module whose dependencies share a transitive dependency (simple diamond)
+/// succeeds without a version conflict error (pre-fix: ERROR #5001: Exact version matches do not agree).
+/// All modules update from 1.0.0 to 1.1.0.
+///     parent
+///     /    \
+///    a      b
+///     \    /
+///      base
+Method TestSharedTransitiveDependencyUpdate()
+{
+    set v1Dir = ..GetModuleDir("update-shared-transitive-dep", "simple-diamond", "1.0.0")
+    set v2Dir = ..GetModuleDir("update-shared-transitive-dep", "simple-diamond", "1.1.0")
+
+    set sc = ##class(%IPM.Main).Shell("load " _ v1Dir)
+    do $$$AssertStatusOK(sc, "Loaded update-shared-transitive-dep 1.0.0")
+
+    set sc = ##class(%IPM.Main).Shell("update update-shared-transitive-dep-parent -path " _ v2Dir)
+    do $$$AssertStatusOK(sc, "Updated to 1.1.0 without version conflict error")
+
+    for modName = "update-shared-transitive-dep-parent","update-shared-transitive-dep-a","update-shared-transitive-dep-b","update-shared-transitive-dep-base" {
+        set mod = ##class(%IPM.Storage.Module).NameOpen(modName, , .openSC)
+        do $$$AssertStatusOK(openSC, modName _ " opened after update")
+        if $$$ISOK(openSC) {
+            do $$$AssertEquals(mod.VersionString, "1.1.0", modName _ " updated to 1.1.0")
+        }
+    }
+
+    do ..CleanUp()
+}
+
+/// Tests that updating a module with an offset-diamond dependency topology succeeds without a version
+/// conflict error. All modules update from 1.0.0 to 1.1.0.
+/// Without the fix, installing c 1.1.0 sees stale d 1.0.0 in the DB constraining base to =1.0.0,
+/// conflicting with c's =1.1.0 requirement.
+///     parent
+///    /  |   \
+///   a   b    |
+///    \  /    |
+///    mid     d
+///     |      |
+///     c      |
+///      \    /
+///       base
+Method TestOffsetDiamondUpdate()
+{
+    set v1Dir = ..GetModuleDir("update-shared-transitive-dep", "offset-diamond", "1.0.0")
+    set v2Dir = ..GetModuleDir("update-shared-transitive-dep", "offset-diamond", "1.1.0")
+
+    set sc = ##class(%IPM.Main).Shell("load " _ v1Dir)
+    do $$$AssertStatusOK(sc, "Loaded offset-diamond 1.0.0")
+
+    set sc = ##class(%IPM.Main).Shell("update update-shared-transitive-dep-od-parent -path " _ v2Dir)
+    do $$$AssertStatusOK(sc, "Updated to 1.1.0 without version conflict error")
+
+    for modName = "update-shared-transitive-dep-od-parent","update-shared-transitive-dep-od-a","update-shared-transitive-dep-od-b","update-shared-transitive-dep-od-d","update-shared-transitive-dep-od-mid","update-shared-transitive-dep-od-c","update-shared-transitive-dep-od-base" {
+        set mod = ##class(%IPM.Storage.Module).NameOpen(modName, , .openSC)
+        do $$$AssertStatusOK(openSC, modName _ " opened after update")
+        if $$$ISOK(openSC) {
+            do $$$AssertEquals(mod.VersionString, "1.1.0", modName _ " updated to 1.1.0")
+        }
+    }
+
+    do ..CleanUp()
+}
+
 /// Tests that dev mode is not propagated to dependencies during update
 Method TestDevModePropagation()
 {
@@ -660,6 +725,76 @@ Method TestDevModePropagation()
     set dep = ##class(%IPM.Storage.Module).NameOpen("simplest-module-dep", sc)
     do $$$AssertStatusOK(sc, "Opened dependency succesfully")
     do $$$AssertEquals(dep.DeveloperMode, 0)
+}
+
+/// Test case to make sure that update doesn't fail due to version errors that get resolved as a part of update
+/// i.e. - Module A 2.0.0 requires Module B ^1.0.0
+///      - Module A 2.1.0 requires Module B ^2.0.0
+///      - Pre-Update: Module A 2.0.0, Module B 1.0.0
+///      - Post-Update: Module A 2.1.0, Module B 2.0.0
+///      - Don't want a version error to be thrown in flight when Module A is 2.1.0 and Module B is still 1.0.0
+Method TestDependencyVersionsUpdated()
+{
+    // Define variables for this test
+    set modA = "module-a"
+    set modB = "module-b"
+    set modC = "module-c"
+    set modD = "module-d"
+
+    set modAPreVersion = "2.0.0"
+    set modBPreVersion = "1.0.0"
+    set modCPreVersion = "5.6.45+snapshot"
+
+    set modAErrorVersion = "2.0.5+snapshot"
+
+    set modAPostVersion = "2.1.0+snapshot"
+    set modBPostVersion = "2.0.0+snapshot"
+    set modCPostVersion = "6.2.0+snapshot"
+
+    // Install base module module-a
+    set sc = ##class(%IPM.Main).Shell("install -v " _ modA _ " " _ modAPreVersion)
+    do $$$AssertStatusOK(sc, "Successfully installed " _ modA _ " " _ modAPreVersion)
+
+    // Confirm that module-a and dependencies were installed with the correct versions
+    set mod = ##class(%IPM.Storage.Module).NameOpen(modA)
+    do $$$AssertEquals(mod.Version.ToString(), modAPreVersion, "Module " _ modA _ " correctly installed as " _ modAPreVersion)
+    set mod = ##class(%IPM.Storage.Module).NameOpen(modB)
+    do $$$AssertEquals(mod.Version.ToString(), modBPreVersion, "Module " _ modB _ " correctly installed as " _ modBPreVersion)
+    set mod = ##class(%IPM.Storage.Module).NameOpen(modC)
+    do $$$AssertEquals(mod.Version.ToString(), modCPreVersion, "Module " _ modC _ " correctly installed as " _ modCPreVersion)
+    kill mod
+
+    // Install module-d prior to update
+    set sc = ##class(%IPM.Main).Shell("install -v " _ modD)
+    do $$$AssertStatusOK(sc, "Successfully installed " _ modD)
+
+    // Update base module module-a. Update should error due to version incompatabilities caused by module-d
+    set sc = ##class(%IPM.Main).Shell("update -v " _ modA _ " " _ modAPostVersion)
+    do $$$AssertStatusNotOK(sc, "Updating " _ modA _ " fails due to version errors with previously installed " _ modD)
+
+    // Uninstall module-d since we don't need it anymore
+    set sc = ##class(%IPM.Main).Shell("uninstall -v " _ modD)
+    do $$$AssertStatusOK(sc, "Successfully uninstalled " _ modD)
+
+    // Try updating module-a to a version that will fail with the same resource defined in module-a and module-c post-update
+    set sc = ##class(%IPM.Main).Shell("update -v " _ modA _ " " _ modAErrorVersion)
+    do $$$AssertStatusNotOK(sc, "Updating " _ modA _ " to version " _ modAErrorVersion _ " fails due to same resource in modules a and c")
+
+    // Now do an update that should succeed
+    set sc = ##class(%IPM.Main).Shell("update -v " _ modA _ " " _ modAPostVersion)
+    do $$$AssertStatusOK(sc, "Successfully updated " _ modA _ " and its dependencies")
+
+    // Confirm that module-a and dependencies were updated to the correct versions
+    set mod = ##class(%IPM.Storage.Module).NameOpen(modA)
+    do $$$AssertEquals(mod.Version.ToString(), modAPostVersion, "Module " _ modA _ " correctly installed as " _ modAPostVersion)
+    set mod = ##class(%IPM.Storage.Module).NameOpen(modB)
+    do $$$AssertEquals(mod.Version.ToString(), modBPostVersion, "Module " _ modB _ " correctly installed as " _ modBPostVersion)
+    set mod = ##class(%IPM.Storage.Module).NameOpen(modC)
+    do $$$AssertEquals(mod.Version.ToString(), modCPostVersion, "Module " _ modC _ " correctly installed as " _ modCPostVersion)
+
+    // Uninstall module-a and dependencies
+    set sc = ##class(%IPM.Main).Shell("uninstall -r " _ modA)
+    do $$$AssertStatusOK(sc, "Successfully uninstalled " _ modA _ " and dependencies")
 }
 
 }
