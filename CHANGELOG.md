@@ -5,10 +5,39 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [0.10.8] - Unreleased
+## [0.10.10] - Unreleased
+
+### Added
+- #1117: Add `sync` command for incremental loading of changed files in dev-mode modules. Detects modified files since last sync using SHA-1 hash and recompiles only what is stale. Supports `-delete` for processing removed files and `-test` for running changed test-phase unit tests.
 
 ### Fixed
+- Performance: Studio project creation on package load in dev mode is now 80% faster.
 - #994: Prevent crash in `zn` command when target namespace lacks IPM mappings
+
+## [0.10.9] - 2026-08-05
+
+### Added
+- #1178: Add `-password-env` and `-token-env` modifiers to the `repo` command to read the password/token from a named environment variable (secure alternatives to `-password` and `-token`).
+
+### Changed
+- #1186: Change %IPM.Main:ShellScript() to return a status.
+
+### Fixed
+- #1207: Zero-byte files are now supported in IPM modules
+- #1209: Fix IPM installer failing on certain environments with (partially) installed older IPM versions
+- #1212: Fix improper parsing of module versions with dashes in the pre-release string
+
+## [0.10.8] - 2026-07-08
+
+### Fixed
+- #1192: Fix dependency resolution dropping incompatibilities and along with that fix a bug where
+semver Intersection would incorrectly pass if an exact version is compared against a range even with
+no overlap.
+- #1077: Fixed error handling of dependency resolution to correctly report what the offending
+modules are.
+- #1187: Remove extra path entries in output of %IPM.Storage.ResourceReference:ResolveChildren() that broke unguarded downstream callers.
+- #1191: Fixed issue where configured Python version would not be used automatically during calls to pip
+- #1198: Fixed bug where using `-password-stdin` would leave the IPM terminal in secret mode
 
 ## [0.10.7] - 2026-05-29
 

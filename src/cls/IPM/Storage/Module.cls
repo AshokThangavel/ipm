@@ -1014,10 +1014,7 @@ Method BuildDependencyGraph(
                         // Caches
                         .repoSearchCache, .manifestCache, .moduleCache,
                         pCoUpdatingModules)
-                    // For fuzzy, continue even if one fails
-                    if $$$ISERR(sc) {
-                        // Error will surface later if unresolvable
-                    }
+                    $$$ThrowOnError(sc)
                 }
             }
 
@@ -1102,8 +1099,8 @@ Method ProcessSingleDependencyIterative(
 
             set sc = ##class(%IPM.General.SemanticVersionExpression).FromString(otherReq,.tExpr)
             $$$ThrowOnError(sc)
-            set searchExpr = searchExpr.And(tExpr)
             set constraintList = constraintList_$listbuild(sourcePath_": "_otherReq)
+            set searchExpr = searchExpr.And(tExpr, pDep.Name, constraintList)
         }
 
         if 'pIgnoreInstalledModules {
@@ -1123,8 +1120,8 @@ Method ProcessSingleDependencyIterative(
                 pDep.Name,otherDepsList,,.installedReqExpr,.installedConstraintList
             )
             $$$ThrowOnError(sc)
-            set searchExpr = searchExpr.And(installedReqExpr)
             set constraintList = constraintList_installedConstraintList
+            set searchExpr = searchExpr.And(installedReqExpr, pDep.Name, constraintList)
         }
 
         // Check if we already have a satisfactory version
@@ -1158,8 +1155,8 @@ Method ProcessSingleDependencyIterative(
                 set rangeString = ">="_localObj.VersionString
                 set tSC = ##class(%IPM.General.SemanticVersionExpression).FromString(rangeString,.currentlyInstalledExpr)
                 $$$ThrowOnError(tSC)
-                set searchExpr = searchExpr.And(currentlyInstalledExpr)
                 set constraintList = constraintList_$listbuild(localObj.Name_": "_rangeString_" (currently installed, downgrade not permitted)")
+                set searchExpr = searchExpr.And(currentlyInstalledExpr, pDep.Name, constraintList)
             }
         }
 
@@ -1252,6 +1249,11 @@ Method ProcessSingleDependencyIterative(
                     #dim subDep As %IPM.Storage.ModuleReference
                     set subDep = moduleObj.Dependencies.GetAt(k)
 
+                    // Skip out-of-scope dependencies (same logic as BuildDependencyGraph main loop)
+                    if '..HasScope(pPhases, subDep.Scope) {
+                        continue
+                    }
+
                     // Check if this dependency conflicts with what we already have
                     if $data(dependencyGraph(subDep.Name), existingInfo) {
                         set existingVersion = $listget(existingInfo, 3)
@@ -1276,7 +1278,9 @@ Method ProcessSingleDependencyIterative(
                 }
             }
 
-            // If no candidate worked, use last one and let errors surface later
+            // If no valid candidate was found via quick validation, fall through with the last
+            // candidate. The real constraint conflict will surface when BFS processes its
+            // sub-dependencies and the constraint accumulation detects the incompatibility.
             if 'resultFound {
                 merge pDependencyGraph = dependencyGraph
                 set pWorkQueue(pDepth + 1, pDep.Name) = $listbuild(pModulePath_$listbuild(pDep.Name), pDep.Scope)
@@ -1367,6 +1371,11 @@ Method GetResolvedReferences(
             kill tempArray("Scope")
             if ..HasScope(pPhases, resourceScope) && ..HasScope(pPhases, attrScope) {
                 merge pReferenceArray(..Name) = tempArray
+                // ResolveChildren does not emit path entries for document enumeration. Re-add here
+                // because ExportSingleModule needs the path entry to trigger its directory-copy branch.
+                if $extract(tResource.Name) = "/" {
+                    set pReferenceArray(..Name, tResource.Name) = ..Name
+                }
             }
             if $$$ISERR(tSC) {
                 quit
@@ -1739,9 +1748,12 @@ Method GetStudioProject(
                 }
 
                 // Add object code for deployed items, since source is unavailable.
-                $$$ThrowOnError(..AddItemToProject(pProject,tChildResourceKey))
+                // Skip the per-item project check; it validates the whole project each time. One
+                // check after all items are added covers the same ground far more cheaply.
+                $$$ThrowOnError(..AddItemToProject(pProject,tChildResourceKey,0))
             }
         }
+        $$$ThrowOnError(pProject.Check())
         $$$ThrowOnError(pProject.%Save())
     } catch e {
         set tSC = e.AsStatus()
@@ -1749,9 +1761,15 @@ Method GetStudioProject(
     quit tSC
 }
 
+/// Adds <var>pResourceName</var> to <var>tProject</var>.
+/// <var>pCheck</var> controls whether the project is validated after the item is added.
+/// <method>Check</method> validates every item in the project, so calling it once per added item is
+/// quadratic in the number of items; callers adding many items in a loop should pass 0 and call
+/// <method>Check</method> once after the loop instead.
 ClassMethod AddItemToProject(
 	tProject As %Studio.Project,
-	pResourceName As %String) As %Status [ Internal ]
+	pResourceName As %String,
+	pCheck As %Boolean = 1) As %Status [ Internal ]
 {
     set tSC = $$$OK
     try {
@@ -1762,7 +1780,9 @@ ClassMethod AddItemToProject(
         } else {
             do tProject.AddItem(pResourceName)
         }
-        $$$ThrowOnError(tProject.Check())
+        if pCheck {
+            $$$ThrowOnError(tProject.Check())
+        }
     } catch e {
         set tSC = e.AsStatus()
     }
